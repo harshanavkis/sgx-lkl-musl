@@ -24,31 +24,51 @@ static void *volatile vdso_func = (void *)cgt_init;
 
 /* Straight from linux::arch/x86/include/asm/vgtod.h */
 typedef uint64_t gtod_long_t;
-struct vsyscall_gtod_data {
-	unsigned seq;
+#define CLOCK_REALTIME			0
+#define CLOCK_MONOTONIC			1
+#define CLOCK_PROCESS_CPUTIME_ID	2
+#define CLOCK_THREAD_CPUTIME_ID		3
+#define CLOCK_MONOTONIC_RAW		4
+#define CLOCK_REALTIME_COARSE		5
+#define CLOCK_MONOTONIC_COARSE		6
+#define CLOCK_BOOTTIME			7
+#define CLOCK_REALTIME_ALARM		8
+#define CLOCK_BOOTTIME_ALARM		9
+/*
+ * The driver implementing this got removed. The clock ID is kept as a
+ * place holder. Do not reuse!
+ */
+#define CLOCK_SGI_CYCLE			10
+#define CLOCK_TAI			11
+#define VDSO_BASES	(CLOCK_TAI + 1)
+struct vdso_timestamp {
+	uint64_t	sec;
+	uint64_t	nsec;
+};
+/*  linux/include/vdso/datapage.h  */
+struct vdso_data {
+	uint32_t seq;
 
-	int vclock_mode;
+	int32_t clock_mode;
 	uint64_t	cycle_last;
 	uint64_t	mask;
 	uint32_t	mult;
 	uint32_t	shift;
 
-	/* open coded 'struct timespec' */
-	uint64_t	wall_time_snsec;
-	gtod_long_t	wall_time_sec;
-	gtod_long_t	monotonic_time_sec;
-	uint64_t	monotonic_time_snsec;
-	gtod_long_t	wall_time_coarse_sec;
-	gtod_long_t	wall_time_coarse_nsec;
-	gtod_long_t	monotonic_time_coarse_sec;
-	gtod_long_t	monotonic_time_coarse_nsec;
+	struct vdso_timestamp	basetime[VDSO_BASES];
+	//union {
+	//	struct vdso_timestamp	basetime[VDSO_BASES];
+	//	struct timens_offset	offset[VDSO_BASES];
+	//};
 
-	int		tz_minuteswest;
-	int		tz_dsttime;
+	int32_t		tz_minuteswest;
+	int32_t		tz_dsttime;
+	int32_t		hrtimer_res;
+	int32_t		__unused;
 };
 
 /* Straight from linux::arch/x86/include/asm/vvar.h */
-static int __vsyscall_gtod_data_offset = 128;
+static int __vdso_data_offset = 128;
 
 static inline uint32_t
 __iter_div_u64_rem(uint64_t dividend, uint32_t divisor, uint64_t *remainder)
@@ -69,7 +89,7 @@ __iter_div_u64_rem(uint64_t dividend, uint32_t divisor, uint64_t *remainder)
 	return ret;
 }
 
-static int vdso_read_begin(const struct vsyscall_gtod_data *s)
+static int vdso_read_begin(const struct vdso_data *s)
 {
 	unsigned ret;
 
@@ -83,11 +103,22 @@ retry:
 	return ret;
 }
 
-static int vdso_read_retry(const struct vsyscall_gtod_data *s, unsigned start)
+static int vdso_read_retry(const struct vdso_data *s, unsigned start)
 {
 	a_barrier();
 	return s->seq != start;
 }
+
+enum vdso_clock_mode {
+	VDSO_CLOCKMODE_NONE,
+	VDSO_CLOCKMODE_TSC,
+	VDSO_CLOCKMODE_PVCLOCK,
+	VDSO_CLOCKMODE_HVCLOCK,
+	VDSO_CLOCKMODE_MAX,
+	/* Indicator for time namespace VDSO */
+	VDSO_CLOCKMODE_TIMENS = INT_MAX,
+};
+
 
 #ifndef SGXLKL_HW
 
@@ -99,14 +130,11 @@ static uint64_t rdtsc_ordered(void)
 	return (high << 32) + low;
 }
 
-#define VCLOCK_TSC 1
-
-static uint64_t vgetsns(const volatile struct vsyscall_gtod_data *s, int volatile *mode)
+static uint64_t vgetsns(const volatile struct vdso_data *s, int volatile *mode)
 {
 	uint64_t v;
 	uint64_t cycles;
-
-	if (s->vclock_mode == VCLOCK_TSC) {
+	if (s->clock_mode == VDSO_CLOCKMODE_TSC) {
 		uint64_t rdtsc = (uint64_t)rdtsc_ordered();
 		uint64_t last = s->cycle_last;
 		cycles = (rdtsc >= last) ? rdtsc : last;
@@ -138,29 +166,21 @@ int __clock_gettime(clockid_t clk, struct timespec *ts)
 
 	if (libc.vvar_base && (clk == CLOCK_REALTIME || clk == CLOCK_MONOTONIC ||
 	                       clk == CLOCK_REALTIME_COARSE || clk == CLOCK_MONOTONIC_COARSE)) {
-		volatile struct vsyscall_gtod_data *ptr;
+		volatile struct vdso_data *ptr;
 		unsigned seq;
 		uint64_t ns;
 
-                ptr = (struct vsyscall_gtod_data *)((char *)libc.vvar_base + __vsyscall_gtod_data_offset);
+                ptr = (struct vdso_data *)((char *)libc.vvar_base + __vdso_data_offset);
 
 //		do {
 			//seq = vdso_read_begin(ptr);
 		seq = ptr->seq;
-		if (clk == CLOCK_REALTIME) {
-			ts->tv_sec = ptr->wall_time_sec;
-			ns = ptr->wall_time_snsec;
-		} else if (clk == CLOCK_REALTIME_COARSE) {
-			ts->tv_sec = ptr->wall_time_coarse_sec;
-			ns = ptr->wall_time_coarse_nsec;
-		} else if (clk == CLOCK_MONOTONIC) {
-			ts->tv_sec = ptr->monotonic_time_sec;
-			ns = ptr->monotonic_time_snsec;
-		} else if (clk == CLOCK_MONOTONIC_COARSE) {
-			ts->tv_sec = ptr->monotonic_time_coarse_sec;
-			ns = ptr->monotonic_time_coarse_nsec;
+		if (ptr->clock_mode == VDSO_CLOCKMODE_TIMENS) {
+			fprintf(stderr, "Getting the time inside a container not supported right now!\n");
+			exit(1);
 		}
-
+		ts->tv_sec = ptr->basetime[clk].sec;
+		ns = ptr->basetime[clk].nsec;
 		if ((clk == CLOCK_REALTIME || clk == CLOCK_MONOTONIC)) {
 #ifndef SGXLKL_HW
 			// This requires (efficient) RDTSC support which we don't have
